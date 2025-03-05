@@ -9,24 +9,32 @@ from dotenv import load_dotenv
 import chromadb
 import traceback
 import uuid
+from haystack_integrations.components.retrievers.chroma import ChromaQueryTextRetriever
 import PyPDF2
 import google.generativeai as genai
 from haystack import Pipeline
-from haystack.components.embedders import OpenAITextEmbedder
 from haystack.components.generators import OpenAIGenerator
-from haystack.document_stores.in_memory import InMemoryDocumentStore
+from haystack_integrations.components.generators.google_ai import GoogleAIGeminiGenerator
+
 from haystack.components.builders.prompt_builder import PromptBuilder
 from haystack.utils import Secret
-from haystack.dataclasses import Document
-import json
+from haystack_integrations.document_stores.chroma import ChromaDocumentStore
+from haystack.components.converters import PyPDFToDocument
+from haystack import Pipeline
+from haystack.document_stores.in_memory import InMemoryDocumentStore
+from haystack.components.converters import PyPDFToDocument
+from haystack.components.preprocessors import DocumentCleaner
+from haystack.components.preprocessors import DocumentSplitter
+from haystack.components.writers import DocumentWriter
 import sys
+from haystack.components.writers import DocumentWriter
+from haystack.dataclasses import Document
 
 # Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('backend.log'),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -67,16 +75,17 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# Initialize document store
-document_store = InMemoryDocumentStore()
-logger.warning("Document store initialized")
-
 # Initialize ChromaDB client for chat history and documents
 try:
     chroma_client = chromadb.PersistentClient(path="./chroma_db")
     chat_collection = chroma_client.get_or_create_collection("chat_history")
     pdf_collection = chroma_client.get_or_create_collection("pdf_documents")
-    logger.warning("ChromaDB initialized successfully")
+    
+    # Initialize Haystack ChromaDocumentStore
+    document_store = ChromaDocumentStore(
+        persist_path="./chroma_db"
+    )
+    logger.warning("ChromaDB and Haystack ChromaDocumentStore initialized successfully")
 except Exception as e:
     logger.error(f"Error initializing ChromaDB: {e}")
     raise
@@ -86,7 +95,7 @@ AVAILABLE_MODELS = {
     "gpt-3.5-turbo": "gpt-3.5-turbo",
     "gpt-4o": "gpt-4o",
     "gpt-4-turbo": "gpt-4-turbo",
-    "gemini-pro": "gemini-pro"  # Add Gemini Pro model
+    "gemini-pro": "gemini-2.0-pro-exp"  # Updated Gemini Pro model name
 }
 logger.warning(f"Available models: {list(AVAILABLE_MODELS.keys())}")
 
@@ -139,25 +148,55 @@ async def chat(request: ChatRequest):
                 raise ValueError("Google Gemini API key not found in environment variables")
             
             try:
-                # Use Google Gemini for generation
-                logger.warning("Using Google Gemini model")
-
-                gemini_model = genai.GenerativeModel(model_name="gemini-2.0-pro-exp")
+                # Use Google Gemini for generation through Haystack
+                logger.warning("Using Google Gemini model through Haystack")
                 
-                # Convert to Gemini's format
-                gemini_messages = []
-                for msg in request.messages:
-                    role = "user" if msg.role == "user" else "model"
-                    gemini_messages.append({"role": role, "parts": [msg.content]})
+                # Create a chat pipeline
+                chat_pipeline = Pipeline()
                 
-                # Generate response
-                chat = gemini_model.start_chat(history=gemini_messages[:-1])
-                response = chat.send_message(gemini_messages[-1]["parts"][0])
-                response_text = response.text
-                logger.warning("Gemini model completed successfully")
+                # Add Google Gemini generator
+                gemini_generator = GoogleAIGeminiGenerator(
+                    api_key=Secret.from_token(gemini_api_key),
+                    model=AVAILABLE_MODELS[request.model]
+                )
+                chat_pipeline.add_component("generator", gemini_generator)
+                
+                # Extract the last user message
+                last_user_message = next((msg.content for msg in reversed(request.messages) if msg.role == "user"), "")
+                if not last_user_message:
+                    raise ValueError("No user message found")
+                
+                # Run the generator
+                result = chat_pipeline.run(
+                    data={
+                        "generator": {"prompt": last_user_message}
+                    }
+                )
+                
+                # Extract the response
+                response_text = result["generator"]["replies"][0]
+                logger.warning("Gemini model completed successfully through Haystack")
             except Exception as e:
-                logger.error(f"Error using Gemini model: {str(e)}")
-                raise
+                logger.error(f"Error using Gemini model through Haystack: {str(e)}")
+                # Fall back to direct API call if Haystack integration fails
+                try:
+                    logger.warning("Falling back to direct Gemini API call")
+                    gemini_model = genai.GenerativeModel(model_name=AVAILABLE_MODELS[request.model])
+                    
+                    # Convert to Gemini's format
+                    gemini_messages = []
+                    for msg in request.messages:
+                        role = "user" if msg.role == "user" else "model"
+                        gemini_messages.append({"role": role, "parts": [msg.content]})
+                    
+                    # Generate response
+                    chat = gemini_model.start_chat(history=gemini_messages[:-1])
+                    response = chat.send_message(gemini_messages[-1]["parts"][0])
+                    response_text = response.text
+                    logger.warning("Gemini model completed successfully with direct API call")
+                except Exception as fallback_error:
+                    logger.error(f"Error in Gemini fallback: {str(fallback_error)}")
+                    raise
         else:
             # Using OpenAI models
             if not api_key:
@@ -234,29 +273,6 @@ async def chat_with_rag(request: ChatRequest):
         if not user_query:
             raise HTTPException(status_code=400, detail="No user query found in messages")
         
-        # Retrieve relevant document chunks
-        try:
-            # Use ChromaDB to get relevant PDF chunks
-            results = pdf_collection.query(
-                query_texts=[user_query],
-                n_results=5
-            )
-            
-            logger.warning("results: " + str(results))
-            
-            # Extract chunks from results
-            context_chunks = results.get('documents', [[]])[0]
-            context = "\n\n".join(context_chunks)
-            logger.warning(f"Retrieved {len(context_chunks)} document chunks for RAG")
-            logger.warning(context)
-            if not context_chunks:
-                logger.warning("No document chunks found for RAG, falling back to regular chat")
-                return await chat(request)
-        except Exception as e:
-            logger.error(f"Error retrieving documents: {str(e)}")
-            logger.warning("Error in document retrieval, falling back to regular chat")
-            return await chat(request)
-        
         # Check which model to use for generation
         if request.model == "gemini-pro":
             if not gemini_api_key:
@@ -265,26 +281,64 @@ async def chat_with_rag(request: ChatRequest):
             try:
                 # Use Google Gemini for RAG generation
                 logger.warning("Using Google Gemini model for RAG")
-                gemini_model = genai.GenerativeModel(
-                    model_name="gemini-2.0-pro-exp"  # Correct model name
+                
+                # Create a RAG pipeline with Haystack and ChromaDB
+                rag_pipeline = Pipeline()
+                
+                # Add retriever component from ChromaDocumentStore
+                retriever = ChromaQueryTextRetriever(
+                    document_store=document_store,
+                    top_k=5  # Set a reasonable default
                 )
-                # Create a RAG prompt with the retrieved context
-                rag_prompt = f"""
-                Answer the following question based on the provided context. 
-                If the answer is not in the context, say that you don't know.
+                rag_pipeline.add_component("retriever", retriever)
+
+                # Add prompt builder
+                rag_pipeline.add_component("prompt_builder", PromptBuilder(
+                    template="""
+                    Answer the following question based on the provided context. 
+                    If the answer is not in the context, say that you don't know.
+                    
+                    Context:
+                    {% for document in documents %}
+                    {{ document.content }}
+                    {% endfor %}
+                    
+                    Question: {{query}}
+                    
+                    Answer:
+                    """
+                ))
                 
-                Context:
-                {context}
+                # Add Google Gemini generator
+                gemini_generator = GoogleAIGeminiGenerator(
+                    api_key=Secret.from_token(gemini_api_key),
+                    model=AVAILABLE_MODELS[request.model]
+                )
+                rag_pipeline.add_component("generator", gemini_generator)
                 
-                Question: {user_query}
+                # Connect components
+                rag_pipeline.connect("retriever", "prompt_builder.documents")
+                rag_pipeline.connect("prompt_builder", "generator")
                 
-                Answer:
-                """
-                
-                # Generate response
-                response = gemini_model.generate_content(rag_prompt)
-                response_text = response.text
-                logger.warning("Gemini RAG completed successfully")
+                # Run the pipeline
+                try:
+                    result = rag_pipeline.run(
+                        data={
+                            "retriever": {"query": user_query},
+                            "prompt_builder": {"query": user_query}
+                        }
+                    )
+                    
+                    # Extract the response
+                    response_text = result["generator"]["replies"][0]
+                    logger.warning("Gemini RAG pipeline completed successfully")
+                except Exception as e:
+                    logger.error(f"Error running Haystack pipeline: {str(e)}")
+                    # If no documents were found, fall back to regular chat
+                    if "No documents found" in str(e):
+                        logger.warning("No documents found for RAG, falling back to regular chat")
+                        return await chat(request)
+                    raise
                 
                 return {
                     "response": response_text,
@@ -292,48 +346,90 @@ async def chat_with_rag(request: ChatRequest):
                 }
             except Exception as e:
                 logger.error(f"Error using Gemini model for RAG: {str(e)}")
+                # If no documents were found, fall back to regular chat
+                if "No documents found" in str(e):
+                    logger.warning("No documents found for RAG, falling back to regular chat")
+                    return await chat(request)
                 raise
         else:
             # Check if we have a valid OpenAI API key
             if not api_key:
                 raise ValueError("OpenAI API key not found in environment variables")
             
-            # Create RAG pipeline
-            
-            # Prepare prompt with manually retrieved chunks
-            prompt_template = """
-            Answer the following question based on the given context:
-            
-            Context:
-            {context}
-            
-            Question: {query}
-            
-            Answer:
-            """
-            
-            # Replace template variables manually
-            prompt = prompt_template.replace("{context}", context).replace("{query}", user_query)
-            
-            # Add generator
-            generator = OpenAIGenerator(
-                api_key=api_key_secret,
-                model=AVAILABLE_MODELS[request.model]
-            )
-            
+            # Create a complete Haystack RAG pipeline with ChromaDB
             try:
-                # Try direct generation with the prompt
-                result = generator.run(prompt=prompt)
-                logger.warning("Generator completed successfully with direct prompt")
-                response_text = result["replies"][0]
+                logger.warning(f"Using OpenAI model {AVAILABLE_MODELS[request.model]} for RAG")
+                
+                # Create the RAG pipeline
+                rag_pipeline = Pipeline()
+                
+                # Add retriever component from ChromaDocumentStore
+                retriever = ChromaQueryTextRetriever(
+                    document_store=document_store,
+                    
+                )
+                rag_pipeline.add_component("retriever", retriever)
+                
+                # Add prompt builder
+                rag_pipeline.add_component("prompt_builder", PromptBuilder(
+                    template="""
+                    Answer the following question based on the provided context. 
+                    If the answer is not in the context, say that you don't know.
+                    
+                    Context:
+                    {% for document in documents %}
+                    {{ document.content }}
+                    {% endfor %}
+                    
+                    Question: {{query}}
+                    
+                    Answer:
+                    """
+                ))
+                
+                # Add generator
+                rag_pipeline.add_component("generator", OpenAIGenerator(
+                    api_key=api_key_secret,
+                    model=AVAILABLE_MODELS[request.model]
+                ))
+                
+                # Connect components
+                rag_pipeline.connect("retriever", "prompt_builder.documents")
+                rag_pipeline.connect("prompt_builder", "generator")
+                
+                # Run the pipeline
+                try:
+                    result = rag_pipeline.run(
+                        data={
+                            "retriever": {"query": user_query, "top_k": 5, "include_metadata": True, },
+                            "prompt_builder": {"query": user_query}
+                        }
+                    )
+                    
+                    logger.warning(f"Result: {result}")
+                    
+                    # Extract the response
+                    response_text = result["generator"]["replies"][0]
+                    logger.warning("OpenAI RAG pipeline completed successfully")
+                except Exception as e:
+                    logger.error(f"Error running Haystack pipeline: {str(e)}")
+                    # If no documents were found, fall back to regular chat
+                    if "No documents found" in str(e):
+                        logger.warning("No documents found for RAG, falling back to regular chat")
+                        return await chat(request)
+                    raise
+                
+                return {
+                    "response": response_text,
+                    "model": request.model
+                }
             except Exception as e:
-                logger.error(f"Error in direct generation: {str(e)}")
+                logger.error(f"Error in Haystack RAG pipeline: {str(e)}")
+                # If no documents were found, fall back to regular chat
+                if "No documents found" in str(e):
+                    logger.warning("No documents found for RAG, falling back to regular chat")
+                    return await chat(request)
                 raise
-            
-            return {
-                "response": response_text,
-                "model": request.model
-            }
     
     except Exception as e:
         logger.error(f"Error in RAG endpoint: {str(e)}")
@@ -404,6 +500,21 @@ async def upload_pdf(file: UploadFile = File(...)):
             
             logger.warning(f"PDF indexed with document_id: {document_id}")
             
+            # Add to Haystack ChromaDocumentStore
+            haystack_docs = []
+            for i, text in enumerate(texts):
+                haystack_docs.append(
+                    Document(
+                        content=text,
+                        meta=metadatas[i]
+                    )
+                )
+            
+            # Create a document writer and write documents to the store
+            writer = DocumentWriter(document_store=document_store)
+            writer.run(documents=haystack_docs)
+            logger.warning(f"Added {len(haystack_docs)} documents to Haystack ChromaDocumentStore")
+            
             # Clean up temp file
             os.unlink(temp_file.name)
             
@@ -432,14 +543,7 @@ async def add_document(document: Dict[str, Any]):
     Add a document to the document store for RAG
     """
     try:
-        # Add to Haystack document store
-        doc = Document(
-            content=document.get("content", ""),
-            meta=document.get("meta", {})
-        )
-        document_store.write_documents([doc])
-        
-        # Also add to ChromaDB for consistency
+        # Add to ChromaDB
         document_id = str(uuid.uuid4())
         pdf_collection.add(
             documents=[document.get("content", "")],
@@ -447,6 +551,17 @@ async def add_document(document: Dict[str, Any]):
             ids=[document_id]
         )
         
+        # Add to Haystack ChromaDocumentStore
+        doc = Document(
+            content=document.get("content", ""),
+            meta=document.get("meta", {})
+        )
+        
+        # Create a document writer and write documents to the store
+        writer = DocumentWriter(document_store=document_store)
+        writer.run(documents=[doc])
+        
+        logger.warning(f"Document added to ChromaDB and Haystack with ID: {document_id}")
         return {"status": "success", "document_id": document_id}
     except Exception as e:
         logger.error(f"Error adding document: {str(e)}")
