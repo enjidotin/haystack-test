@@ -1,0 +1,77 @@
+/* Basic markdown styling */
+.markdown {
+    @apply max-w-none;
+    @apply text-foreground;
+}
+
+.markdown h1 {
+    @apply mb-6 text-3xl font-bold tracking-tight;
+}
+
+.markdown h2 {
+    @apply mt-10 mb-4 text-2xl font-semibold tracking-tight;
+}
+
+.markdown h3 {
+    @apply mt-8 mb-3 text-xl font-semibold tracking-tight;
+}
+
+.markdown h4 {
+    @apply mt-6 mb-2 text-lg font-semibold tracking-tight;
+}
+
+.markdown p {
+    @apply mb-4 leading-7;
+}
+
+.markdown a {
+    @apply text-blue-600 dark: text-blue-400 hover:underline;
+}
+
+.markdown ul {
+    @apply mb-4 list-disc list-outside pl-6;
+}
+
+.markdown ol {
+    @apply mb-4 list-decimal list-outside pl-6;
+}
+
+.markdown li {
+    @apply mb-2;
+}
+
+.markdown code {
+    @apply px-1 py-0.5 bg-gray-100 dark: bg-gray-800 rounded text-sm;
+}
+
+.markdown pre {
+    @apply p-4 mb-4 bg-gray-100 dark: bg-gray-800 rounded-md overflow-x-auto;
+}
+
+.markdown pre code {
+    @apply bg-transparent dark: bg-transparent p-0;
+}
+
+.markdown blockquote {
+    @apply pl-4 border-l-4 border-gray-300 dark: border-gray-700 italic;
+}
+
+.markdown img {
+    @apply max-w-full h-auto mb-4;
+}
+
+.markdown table {
+    @apply w-full mb-6 text-sm border-collapse;
+}
+
+.markdown th {
+    @apply py-2 px-3 text-left font-semibold border-b border-gray-300 dark: border-gray-700;
+}
+
+.markdown td {
+    @apply py-2 px-3 border-b border-gray-200 dark: border-gray-800;
+}
+
+.markdown hr {
+    @apply my-8 border-gray-300 dark: border-gray-700;
+}
