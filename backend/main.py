@@ -15,6 +15,7 @@ import google.generativeai as genai
 from haystack import Pipeline
 from haystack.components.generators import OpenAIGenerator
 from haystack_integrations.components.generators.google_ai import GoogleAIGeminiGenerator
+from chunkr_ai import Chunkr
 
 from haystack.components.builders.prompt_builder import PromptBuilder
 from haystack.utils import Secret
@@ -29,6 +30,7 @@ from haystack.components.writers import DocumentWriter
 import sys
 from haystack.components.writers import DocumentWriter
 from haystack.dataclasses import Document
+import json
 
 # Configure logging
 logging.basicConfig(
@@ -439,7 +441,7 @@ async def chat_with_rag(request: ChatRequest):
 @app.post("/upload/pdf", response_model=PDFResponse)
 async def upload_pdf(file: UploadFile = File(...)):
     """
-    Upload and process a PDF file for RAG
+    Upload and process a PDF file for RAG using Chunkr
     """
     if not file.filename.lower().endswith('.pdf'):
         return PDFResponse(success=False, message="Only PDF files are supported")
@@ -456,40 +458,58 @@ async def upload_pdf(file: UploadFile = File(...)):
             logger.error(f"Error saving uploaded file: {str(e)}")
             return PDFResponse(success=False, message=f"Error processing file: {str(e)}")
         
-        # Process PDF
         try:
-            pdf_reader = PyPDF2.PdfReader(temp_file.name)
-            page_count = len(pdf_reader.pages)
-            logger.warning(f"Processing PDF with {page_count} pages")
+            # Initialize Chunkr client
+            chunkr_api_key = os.environ.get("CHUNKR_API_KEY", "")
+            if not chunkr_api_key:
+                logger.warning("CHUNKR_API_KEY not found in environment variables. Make sure it's set or pass it directly.")
             
-            # Extract text from each page and create chunks
-            chunks = []
-            for i, page in enumerate(pdf_reader.pages):
-                text = page.extract_text()
-                if text.strip():
-                    # Split page into smaller chunks if needed
-                    # Here we split by paragraphs, but you can use more sophisticated methods
-                    paragraphs = text.split('\n\n')
-                    for j, para in enumerate(paragraphs):
-                        if para.strip():
-                            chunks.append({
-                                "text": para.strip(),
-                                "metadata": {
-                                    "source": file.filename,
-                                    "page": i + 1,
-                                    "chunk": j + 1
-                                }
-                            })
+            chunkr = Chunkr(api_key=chunkr_api_key if chunkr_api_key else None)
             
-            logger.warning(f"Created {len(chunks)} text chunks from PDF")
+            # Configure chunking parameters
+            
+            # Process PDF with Chunkr
+            task = await chunkr.upload(temp_file.name)
+
+            # Wait for the task to complete and get the chunks
+            chunks = task.output.chunks
+            logger.warning(f"Created {len(chunks)} text chunks from PDF using Chunkr")
             
             # Add chunks to ChromaDB
             document_id = str(uuid.uuid4())
             
             # Prepare data for ChromaDB
-            texts = [chunk["text"] for chunk in chunks]
-            metadatas = [chunk["metadata"] for chunk in chunks]
-            ids = [f"{document_id}_{i}" for i in range(len(chunks))]
+            texts = []
+            metadatas = []
+            
+            # Debug each chunk in detail
+            for i, chunk in enumerate(chunks):
+                logger.warning(f"Processing chunk {i+1}/{len(chunks)}")
+                logger.warning(f"Chunk ID: {chunk.chunk_id}")
+                logger.warning(f"Chunk length: {chunk.chunk_length}")
+                logger.warning(f"Number of segments: {len(chunk.segments)}")
+                
+                # The 'embed' property contains the markdown text of all segments
+                chunk_text = chunk.embed
+                logger.warning(f"Chunk text: {chunk_text[:100]}..." if len(chunk_text) > 100 else chunk_text)
+                
+                # Get page numbers from segments
+                page_numbers = set(segment.page_number for segment in chunk.segments if hasattr(segment, 'page_number'))
+                pages_str = ",".join(str(page) for page in page_numbers)
+                logger.warning(f"Pages in chunk: {pages_str}")
+                
+                # Extract metadata from chunk
+                chunk_metadata = {
+                    "source": file.filename,
+                    "chunk_id": chunk.chunk_id,
+                    "pages": pages_str,
+                    "chunk_index": i + 1
+                }
+                
+                texts.append(chunk_text)
+                metadatas.append(chunk_metadata)
+            
+            ids = [f"{document_id}_{i}" for i in range(len(texts))]
             
             # Add to ChromaDB
             pdf_collection.add(
@@ -502,10 +522,10 @@ async def upload_pdf(file: UploadFile = File(...)):
             
             # Add to Haystack ChromaDocumentStore
             haystack_docs = []
-            for i, text in enumerate(texts):
+            for i, chunk in enumerate(chunks):
                 haystack_docs.append(
                     Document(
-                        content=text,
+                        content=chunk.embed,
                         meta=metadatas[i]
                     )
                 )
@@ -515,22 +535,24 @@ async def upload_pdf(file: UploadFile = File(...)):
             writer.run(documents=haystack_docs)
             logger.warning(f"Added {len(haystack_docs)} documents to Haystack ChromaDocumentStore")
             
-            # Clean up temp file
-            os.unlink(temp_file.name)
-            
             return PDFResponse(
                 success=True,
                 document_id=document_id,
-                page_count=page_count,
-                message=f"PDF processed successfully with {len(chunks)} text chunks"
+                page_count=len(set(segment.page_number for chunk in chunks for segment in chunk.segments if hasattr(segment, 'page_number'))),
+                message=f"PDF processed successfully with {len(chunks)} text chunks using Chunkr"
             )
             
         except Exception as e:
-            logger.error(f"Error processing PDF: {str(e)}")
+            logger.error(f"Error processing PDF with Chunkr: {str(e)}")
             logger.error(traceback.format_exc())
-            # Clean up temp file
-            os.unlink(temp_file.name)
             return PDFResponse(success=False, message=f"Error processing PDF: {str(e)}")
+        finally:
+            # Clean up resources
+            try:
+                await chunkr.close()
+                os.unlink(temp_file.name)
+            except Exception as cleanup_error:
+                logger.error(f"Error during cleanup: {str(cleanup_error)}")
             
     except Exception as e:
         logger.error(f"Error in PDF upload: {str(e)}")
@@ -571,4 +593,4 @@ async def add_document(document: Dict[str, Any]):
 if __name__ == "__main__":
     import uvicorn
     logger.warning("Starting server...")
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True) 
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, loop="asyncio", log_level="debug") 
